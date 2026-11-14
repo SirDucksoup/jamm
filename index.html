@@ -492,11 +492,12 @@ function bgStop(){
   bgTrack = null;
   if (bgSyncUI) bgSyncUI();
 }
-function bgStart(chords, bpm, strum){
+function bgStart(chords, bpm, strum, swing){
   bgStop();
   if (!chords || !chords.length || !(bpm > 0)) return;
   const ctx0 = audio(); // создать аудиоконтекст, если его ещё нет (первый ▶ Фон после загрузки)
   strum = typeof strum === 'string' ? strum.replace(/[^DUX-]/g, '') : ''; // '' = ровно, как раньше
+  swing = (typeof swing === 'number' && swing > 0) ? Math.min(100, swing) : 0; // 0 = ровные восьмые, 66 ≈ триольное качание
   bgTrack = { chords, bpm, nextTime: ctx0.currentTime + 0.1, barIdx: 0, timer: 0 };
   const barDur = (60 / bpm) * 4;
   const strumHit = (c, rel, gain) => (CHORD_INTERVALS[c.q] || [0, 4, 7]).forEach((o, i) =>
@@ -507,22 +508,27 @@ function bgStart(chords, bpm, strum){
     while (bgTrack.nextTime < ctx.currentTime + 0.3){
       const c = bgTrack.chords[bgTrack.barIdx % bgTrack.chords.length];
       const t0 = bgTrack.nextTime, rel = Math.max(0, t0 - ctx.currentTime);
+      const eighth = barDur / 8;
+      const slotT = (e) => { // пара восьмых: при качании вторая «подъезжает» (66% ≈ триоль 2:1)
+        const pair = Math.floor(e / 2), pos = e % 2;
+        return t0 + (pair * 2 + (pos === 1 ? 1 + 0.5 * swing / 100 : 0)) * eighth;
+      };
+      const r = (t) => Math.max(0, t - ctx.currentTime);
       if (strum){ // бой: щелчки и штрихи по паттерну (символ = восьмая такта)
-        const eighth = barDur / 8;
         for (let e = 0; e < 8; e++){
           const ch = strum[e % strum.length];
-          const t = t0 + e * eighth, r = Math.max(0, t - ctx.currentTime);
-          if (ch === 'D'){ click(t, 2); strumHit(c, r, 0.4); }
-          else if (ch === 'U'){ click(t, 1); strumHit(c, r, 0.18); }
+          const t = slotT(e);
+          if (ch === 'D'){ click(t, 2); strumHit(c, r(t), 0.4); }
+          else if (ch === 'U'){ click(t, 1); strumHit(c, r(t), 0.18); }
           else if (ch === 'x') click(t, 0);
         }
         pluck(midiFreq(36 + c.root), rel, 0.3); // бас — корень на первой сильной доле
       } else {
         (CHORD_INTERVALS[c.q] || [0, 4, 7]).forEach((o, i) =>
           pluck(midiFreq(48 + c.root + o), rel + i * 0.02, 0.4));                 // аккорд на такт
-        for (let b = 0; b < 4; b++) click(t0 + b * (barDur / 4), b === 0 ? 2 : 0); // ровный бит
-        for (let e = 0; e < 8; e++)                                                // бас — корень восьмыми
-          pluck(midiFreq(36 + c.root), rel + e * (barDur / 8), e % 2 ? 0.16 : 0.28);
+        for (let b = 0; b < 4; b++) click(t0 + b * (barDur / 4), b === 0 ? 2 : 0); // ровный бит по долям
+        for (let e = 0; e < 8; e++)                                                // бас — корень восьмыми (с качанием)
+          pluck(midiFreq(36 + c.root), r(slotT(e)), e % 2 ? 0.16 : 0.28);
       }
       bgTrack.nextTime += barDur;
       bgTrack.barIdx++;
@@ -834,6 +840,18 @@ function playVoicing(v, spread = 0.045){
   });
 }
 
+/* мапинг ноты на гриф: струна с максимальной открытой нотой ≤ midi и лад ≤ maxFret.
+   Единая утилита для слушалки/определителя/записи фразы. null = нота ниже открытой басовой. */
+function midiToGrip(midi, maxFret){
+  const tn = tuningNotes();
+  let best = null;
+  tn.forEach((m, s) => {
+    const f = midi - m;
+    if (f >= 0 && f <= maxFret && (best === null || m > tn[best.s])) best = { s, f, midi: m + f };
+  });
+  return best;
+}
+
 /* ================= ИНСТРУМЕНТ: ТЮНЕР ================= */
 
 /* определение частоты по буферу (автокорреляция с параболической интерполяцией) */
@@ -872,7 +890,7 @@ function autoCorrelate(buf, sampleRate){
    Тюнер и «Слушай меня» включаются одновременно и читают один и тот же звук;
    при уходе со вкладки showTool зовёт el._cleanup корня — микрофон глушится. --- */
 let micState = null;                              // { stream, src, analysers: [{an, cb}], deviceId }
-const micWants = { tuner: false, listen: false }; // кто сейчас хочет микрофон
+const micWants = { tuner: false, listen: false, rec: false }; // кто сейчас хочет микрофон
 const micRebind = [];                             // (пере)подключалки анализаторов активных потребителей
 let refreshDeviceSelect = null;                   // «Слушай меня» подставляет заполнение селекта устройств
 async function micOpen(deviceId){
@@ -1413,13 +1431,10 @@ function renderDetBox(el){
 
   /* хуки для «Слушай меня»: услышанная нота приходит сюда */
   el._addMidi = (midi) => {
-    const tn = tuningNotes();
-    let best = -1; // струна с максимальным открытым звуком ≤ midi (лад 0..12)
-    tn.forEach((m, s) => { if (midi - m >= 0 && midi - m <= 12 && (best < 0 || m > tn[best])) best = s; });
-    if (best < 0) return; // нота ниже открытой басовой — игнор
-    const f = midi - tn[best];
-    if (detNotes.some(d => d.s === best && d.f === f)) return;
-    detNotes.push({ s: best, f, midi: tn[best] + f });
+    const g = midiToGrip(midi, 12); // единый мапинг (мини-гриф — 12 ладов)
+    if (!g) return;
+    if (detNotes.some(d => d.s === g.s && d.f === g.f)) return;
+    detNotes.push({ s: g.s, f: g.f, midi: tuningNotes()[g.s] + g.f });
     update(); drawBoard();
   };
   el._removeMidi = (midi) => {
@@ -1458,6 +1473,14 @@ function renderListen(el){
       '<div class="row" id="l-chips" style="margin-top:10px; gap:4px"></div>' +
       '<div class="muted small" style="margin-top:8px">играй по одной ноте — перебором; весь аккорд разом слушалка научится позже.<br>' +
       'Услышанные ноты сразу попадают в определитель выше — перебрал струны, и он показал аккорд.</div>' +
+      '<div class="row" style="margin-top:6px">' +
+        '<span class="small muted">🎧 слышанные ноты складывать:</span>' +
+        '<select id="l-dest" style="width:auto">' +
+          '<option value="det">в определитель</option>' +
+          '<option value="phrase">во фразу (на грифе)</option>' +
+          '<option value="both">в оба</option>' +
+        '</select>' +
+      '</div>' +
     '</div>';
 
   function detSec(){ return el.previousElementSibling; } // секция определителя стоит прямо перед слушалкой
@@ -1479,8 +1502,21 @@ function renderListen(el){
   }
   function addHeard(midi){
     if (!heard.includes(midi)) heard.push(midi);
-    const det = detSec();
-    if (det && det._addMidi) det._addMidi(midi);
+    const dest = loadUI('tools').listenDest || 'det';
+    if (dest === 'det' || dest === 'both'){
+      const det = detSec();
+      if (det && det._addMidi) det._addMidi(midi);
+    }
+    if (dest === 'phrase' || dest === 'both'){
+      const fretSec = document.getElementById('tool-fret');
+      if (fretSec && fretSec._addPhraseNote) fretSec._addPhraseNote(midi);
+      else { // гриф ещё не открывали — фраза живёт в storage
+        const uiF2 = loadUI('fret');
+        const ph = Array.isArray(uiF2.phrase) ? uiF2.phrase : [];
+        const g = midiToGrip(midi, 12);
+        if (g){ ph.push({ row: g.s, f: g.f, midi: g.midi, dur: 1, on: true }); saveUI('fret', { phrase: ph }); }
+      }
+    }
     drawChips();
   }
   function feed(buf, sr){ // вызывается из общего микрофонного цикла
@@ -1554,6 +1590,12 @@ function renderListen(el){
     micSwitchDevice(id); // перезапуск общего потока: и тюнер, и слушалка подключатся заново
   });
 
+  const destSel = $('#l-dest');
+  if (destSel){
+    destSel.value = loadUI('tools').listenDest || 'det';
+    destSel.addEventListener('change', e => { saveUI('tools', { listenDest: e.target.value }); });
+  }
+
   el._stop = () => { listening = false; }; // корень вкладки глушит микрофон — слушалка сбрасывает своё состояние
 
   drawChips();
@@ -1585,6 +1627,7 @@ function renderTools(el){
   el._cleanup = () => { // уход со вкладки — микрофон глушится ВСЕГДА (общий для тюнера и слушалки)
     micWants.tuner = false;
     micWants.listen = false;
+    micWants.rec = false;
     if (lis._stop) lis._stop();
     micClose();
     const tb = tun.querySelector('[data-act=toggle]');
@@ -1813,7 +1856,10 @@ function renderFretboard(el){
   let songSel = -1;                        // выбранный аккорд песни
   let lastScrolledSel = null;              // какой аккорд уже подсвечен прокруткой стрипа
   let songView = ['tones', 'penta', 'scale'].includes(uiF.songView) ? uiF.songView : 'penta';
-  let phrase = null, phraseLabel = '', phraseTimers = [];  // фраза: [{row, f, midi, dur, on} | {rest, dur, on}]
+  let phrase = Array.isArray(uiF.phrase) && uiF.phrase.length
+    ? uiF.phrase.filter(d => d && Number.isFinite(d.dur) && d.dur > 0).map(d => Object.assign({}, d))
+    : null;                                                  // фраза теперь сохраняется (нужна записи с гитары)
+  let phraseLabel = '', phraseTimers = [];  // фраза: [{row, f, midi, dur, on} | {rest, dur, on}]
   let phraseBpm = Number.isInteger(uiF.phraseBpm) ? uiF.phraseBpm : 120;
   let phraseShow = uiF.phraseShow !== false;
   let phraseLoop = uiF.phraseLoop === true;
@@ -1823,6 +1869,7 @@ function renderFretboard(el){
   let chordOverlay = null;                 // аккорд из прогрессий (разовый показ)
   let visPhrase = uiF.visPhrase !== false;   // глазок «Фраза»: правый бокс
   let visYt = uiF.visYt !== false;           // глазок «Ютуб»: блок ютуб-джема
+  let visRec = uiF.visRec !== false;         // глазок «Запись»: запись фразы с гитары
   let fretLink = uiF.fretLink !== false;     // гриф берёт тонику/гамму из песни
   let adoptedChg = Number.isInteger(uiF.adoptedChg) ? uiF.adoptedChg : 0; // счётчик правок песни, который уже принят
   const PHRASE_COLOR = '#4dd0e1';        // тоника — красная (не путать с аккордными нотами)
@@ -1871,6 +1918,19 @@ function renderFretboard(el){
           '<div class="fret-strips" style="margin-top:8px">' +
             '<div id="f-songstrip" class="side-box side-acc"></div>' +
             '<div id="f-sug" style="display:none; padding:10px 12px; border:1px solid var(--line); border-radius:12px; background:var(--card2)"></div>' +
+          '</div>' +
+          '<div id="f-rec" style="margin-top:8px; border:1px solid var(--line); border-radius:12px; padding:8px 12px">' +
+            '<details>' +
+              '<summary style="cursor:pointer; font-weight:700; color:var(--accent); letter-spacing:1.2px; font-size:13px">🎧 ЗАПИСЬ С ГИТАРЫ — играй перебор, ноты сами пишутся во фразу</summary>' +
+              '<div class="row" style="margin-top:10px">' +
+                '<button class="btn small primary" id="f-rec-toggle">● Записать фразу</button>' +
+                '<label class="row small" style="gap:5px"><input type="checkbox" id="f-rec-clear"> стереть текущую фразу перед записью</label>' +
+                '<span class="muted small" id="f-rec-count">записано нот: 0</span>' +
+              '</div>' +
+              '<div class="muted small" id="f-rec-skip" style="margin-top:4px"></div>' +
+              '<div class="muted small" style="margin-top:6px">играй по одной ноте — перебором; записывается то, что держится ~полсекунды. ' +
+              'Длительность — ♩, правится в редакторе фразы. Записанное видно на дорожке над грифом.</div>' +
+            '</details>' +
           '</div>' +
           '<div id="f-yt" style="margin-top:8px; border:1px solid var(--line); border-radius:12px; padding:8px 12px">' +
             '<details>' +
@@ -2179,6 +2239,71 @@ function renderFretboard(el){
       $('#yt-listen-out').innerHTML = '<span class="muted small">не вышло: ' + esc(e.message || e) + '</span>';
     }
   });
+
+  /* --- 🎧 Запись с гитары: ноты с микрофона → во фразу (общий микрофон вкладки) --- */
+  let recOn = false, recAnalyser = null, recMidi = null, recHold = 0, recLastAdded = null, recCount = 0, recSkip = 0;
+  function recSyncBtn(){
+    const b = $('#f-rec-toggle');
+    if (b){
+      b.textContent = recOn ? '■ Стоп записи' : '● Записать фразу';
+      b.classList.toggle('danger', recOn);
+      b.classList.toggle('primary', !recOn);
+    }
+  }
+  function recStop(){
+    recOn = false;
+    micWants.rec = false;
+    if (recAnalyser){ micDropAnalyser(recAnalyser); recAnalyser = null; }
+    recMidi = null; recHold = 0;
+    micMaybeClose();
+    recSyncBtn();
+  }
+  $('#f-rec-toggle').addEventListener('click', () => {
+    if (recOn){ recStop(); return; }
+    micWants.rec = true;
+    if ($('#f-rec-clear').checked){ phrase = []; rebuildDots(); phraseSide(); draw(); }
+    recCount = 0; recSkip = 0;
+    $('#f-rec-count').textContent = 'записано нот: 0';
+    $('#f-rec-skip').textContent = '';
+    micOpen(loadUI('tools').micDeviceId || '').then(() => {
+      if (!micWants.rec) return; // пока ждали разрешение — запись отменили
+      recOn = true;
+      recAnalyser = micAnalyser();
+      recAnalyser.cb = recFeed;
+      recSyncBtn();
+    }).catch(e => {
+      micWants.rec = false;
+      micMaybeClose();
+      $('#f-rec-skip').textContent = 'микрофон недоступен: ' + (e.message || e);
+    });
+  });
+  function recFeed(buf, sr){ // вызывается из общего микрофонного цикла
+    let rms = 0;
+    for (let i = 0; i < buf.length; i++) rms += buf[i] * buf[i];
+    rms = Math.sqrt(rms / buf.length);
+    const now = performance.now();
+    if (rms < 0.006){ recMidi = null; recHold = 0; recLastAdded = null; return; } // тишина — разделитель
+    const f = autoCorrelate(buf, sr);
+    if (f <= 0) return;
+    const midi = Math.round(69 + 12 * Math.log2(f / settings.a4));
+    if (midi !== recMidi){ recMidi = midi; recHold = now; return; } // новая нота — копим удержание
+    if (now - recHold < 500 || midi === recLastAdded) return; // держится ~полсекунды и не та же подряд
+    const g = midiToGrip(midi, nfrets); // мапинг на гриф с текущим числом ладов
+    if (!g){ recSkip++; $('#f-rec-skip').textContent = 'не влезло на гриф: ' + recSkip + ' (ниже открытой басовой)'; return; }
+    phrase = phrase || [];
+    phrase.push({ row: g.s, f: g.f, midi: g.midi, dur: 1, on: true }); // ♩ по умолчанию
+    recCount++; recLastAdded = midi;
+    $('#f-rec-count').textContent = 'записано нот: ' + recCount;
+    rebuildDots(); phraseSide(); draw(); // бейдж сразу на дорожке над грифом
+  }
+  el._addPhraseNote = (midi) => { // хук для «Слушай меня» (режим «во фразу»)
+    const g = midiToGrip(midi, nfrets);
+    if (!g) return false;
+    phrase = phrase || [];
+    phrase.push({ row: g.s, f: g.f, midi: g.midi, dur: 1, on: true });
+    rebuildDots(); phraseSide(); draw();
+    return true;
+  };
   function songScaleIv(chordRoot, chordQ){ // что играть поверх аккорда с учётом лада песни
     const sm = songModeKey();
     const smName = { maj: 'major', min: 'minor' }[sm] || sm; // в SCALES ключи major/minor
@@ -2390,6 +2515,7 @@ function renderFretboard(el){
       const k = d.row + ':' + d.f;
       if (!seen.has(k)){ seen.add(k); phraseDotsCache.push({ ...d }); }
     });
+    saveUI('fret', { phrase: phrase || [] }); // фраза сохраняется (нужна записи с гитары и перезагрузкам)
   }
   function genPhrase(){
     const src = phraseSource();
@@ -2572,6 +2698,7 @@ function renderFretboard(el){
         e.stopPropagation();
         const d = phrase[+b.dataset.dur];
         d.dur = d.dur === 0.5 ? 1 : (d.dur === 1 ? 2 : 0.5); // ♪ → ♩ → — → ♪
+        saveUI('fret', { phrase: phrase || [] });
         phraseSide(); draw();
       }));
     box.querySelectorAll('[data-del]').forEach(b =>
@@ -2605,6 +2732,7 @@ function renderFretboard(el){
       ['phrase', 'Фраза', 'Правый бокс с фразой', visPhrase],
       ['song', 'Аккорды песни', 'Стрип аккордов песни под грифом', songShow],
       ['yt', 'Ютуб', 'Блок ютуб-джема: что играть под бэктрек', visYt],
+      ['rec', 'Запись', 'Запись фразы с гитары через микрофон', visRec],
     ];
     box.innerHTML = '<span class="small muted" style="white-space:nowrap; margin-right:2px">На экране:</span>' +
       defs.map(d =>
@@ -2624,6 +2752,8 @@ function renderFretboard(el){
     if (sug) sug.style.display = getSong().length ? '' : 'none'; // блок «что играть» — сам, когда в песне есть аккорды
     const yt = $('#f-yt');
     if (yt) yt.style.display = visYt ? '' : 'none';
+    const rec = $('#f-rec');
+    if (rec) rec.style.display = visRec ? '' : 'none';
     const strips = strip ? strip.parentElement : null; // .fret-strips: один видимый блок — на всю ширину
     if (strips && strips.classList.contains('fret-strips'))
       strips.classList.toggle('span1', strip.style.display === 'none' || sug.style.display === 'none');
@@ -2635,6 +2765,7 @@ function renderFretboard(el){
     if (v === 'phrase'){ visPhrase = !visPhrase; saveUI('fret', { visPhrase }); }
     else if (v === 'song'){ songShow = !songShow; saveUI('fret', { songShow }); }
     else if (v === 'yt'){ visYt = !visYt; saveUI('fret', { visYt }); }
+    else if (v === 'rec'){ visRec = !visRec; saveUI('fret', { visRec }); if (!visRec) recStop(); }
     draw();
   });
 
@@ -2904,12 +3035,13 @@ function renderFretboard(el){
     if (Number.isInteger(info.chg) && info.chg !== adoptedChg) adoptFromSong();
   }
   if (songShow && songSel === -1 && getSong().length) songSel = 0; // сразу выбрать первый аккорд
+  rebuildDots(); // фраза загружена из storage — восстановить дорожку
   songStrip();
   phraseSide();
   draw();
   el._refresh = draw;
   el._onSong = () => { if (fretLink) adoptFromSong(); draw(); }; // песня изменилась → стрипы на грифе свежие, привязанный гриф перестраивается
-  el._cleanup = () => { droneStop(); stopPhrase(); ytStopListen(); };
+  el._cleanup = () => { droneStop(); stopPhrase(); ytStopListen(); recStop(); };
   el._hotkey = e => { // гитара в руках: минимум кликов
     switch (e.code){
       case 'Space': playScale(); return true;
@@ -3297,6 +3429,9 @@ function renderSettings(el){
       'и функцию <code>renderMy(el){…}</code>. Появится новая вкладка. Примеры смотри у соседей по массиву.</div>' +
     '</div>' +
     '<div class="card"><h3 style="margin-top:0">История версий</h3><ul class="ver-list">' +
+      '<li><b>3.11.0</b> — духовые: настоящая аппликатура — переключатель «Аппликатура: Настоящая / Упрощённая» в схемах: для тин-вистла (ре) — настоящие таблицы (первая октава D–E–F♯–G–A–B линейно, C♮ — крестованная, C♯ — крест с закрытым низом, вторая октава — те же пальцы + оверблоу с пометкой ▲ «дуй сильнее»); полуприкрытое отверстие рисуется ПОЛУ-залитым кружком; ноты вне настоящей таблицы — упрощённая модель приглушённо (гаммы не «дырявятся»); у «⚙️ СВОЙ СТРОЙ» — всегда упрощённые схемы (переключатель серый). Сопилка/блокфлейта/флейта — пока упрощённые с честной пометкой (не выдумывать данные). Клик по схеме звучит той же нотой, проигрывание не тронуто; выбор запоминается; объяснялка про полуприкрытие и оверблоу для новичка.</li>' +
+      '<li><b>3.10.0</b> — шаффл-блюз: блюзовые фоны играются с качанием — ползунок «Качание» (0–100%) рядом с «▶ Фон»: 0% = ровные восьмые, 66% ≈ классическое триольное качание 2:1 (вторая восьмая пары «подъезжает»), промежуточные — плавно; качание двигает бас-восьмые и штрихи/щелчки паттерна боя. Стили приносят качание сами: Блюз 66%, Рок-н-ролл 70%, Джаз 55%. НОВЫЙ стиль «Шаффл-блюз» — быстрая 12-тактовая блюзовая форма, темп 130, качание 66%, минорная пентатоника, подсказка «играй на „1“ и на „а“ — проговаривай 1-и-а». Урок «Шаффл и свинг» — шаг «в приложении» на фон с качанием. Качание сохраняется.</li>' +
+      '<li><b>3.9.0</b> — 🎧 запись фразы с гитары прямо на грифе: блок «Запись с гитары» (глазок «Запись», свёрнут) — «● Записать фразу» слушает микрофон, и каждая нота, державшаяся ~полсекунды, сама попадает В КОНЕЦ фразы и вспыхивает на дорожке над грифом; счётчик «записано нот: N», «не влезло: M» для нот ниже басовой, чекбокс «стереть текущую фразу перед записью»; длительность ♩ правится в редакторе. Микрофон — общий механизм вкладки-«Инструментов» (micOpen/micPump): запись не мешает тюнеру/слушалке, уход со вкладки глушит. В «Слушай меня» — выбор «слышанные ноты складывать: в определитель / во фразу / в оба». Фраза теперь СОХРАНЯЕТСЯ (перезагрузка не теряет). Общая утилита midiToGrip — единый мапинг ноты на гриф.</li>' +
       '<li><b>3.8.0</b> — 🎬 Суфлёр на вкладке «Песня»: кнопка рядом с «Играть песню» включает крупную строку-подсказку над «Твоей песней» — «сейчас: аккорд» огромным шрифтом (видно с дивана) + «дальше: C · G · Em» — очередь играет песню с начала в темпе песни, аккорды сменяются в ритм, строка плавно обновляется, список автопрокручивается за текущим аккордом (мягко, без рывков). «■» или конец песни — суфлёр выключается и сворачивается; повторное «🎬» — сначала списка. Клик по аккорду в списке при включённом суфлёре — продолжить с него. «▶ Играть песню» без суфлёра работает как раньше (в темпе песни).</li>' +
       '<li><b>3.7.0</b> — транспонирование песни ±полутон: в ряду «Твоя песня» кнопки «♭ −1» и «♯ +1» — одно нажатие сдвигает ВСЮ песню на полутон (каждый аккорд меняет тонику, тип сохраняется; тональность песни едет вместе с аккордами, лад не меняется — ступени I-IV-V не «поехали»); после сдвига сообщение «Песня теперь в …», а для песни из «✨ Сделай красиво» — к сводке дописывается «транспонирована в …»; при пустой песне кнопки серые; жми сколько нужно — циклично по 12 нотам. Гриф и «что играть» подхватывают сами (привязка «→ из песни»). В уроке «Транспонирование ±полутон» — шаг «в приложении» с переходом на кнопки.</li>' +
       '<li><b>3.6.0</b> — метроном ↔ песня: у песни ЕДИНЫЙ темп — ползунок «Темп» переехал в карточку «🎵 Твоя песня» (виден всегда); фон, «▶ Играть песню», «Арпеджио песни» и подсказки играют в темпе песни; «✨ Сделай красиво» приносит темп стиля в этот же ползунок. В метрономе: «⇩ Взять темп песни» (активна, когда песня не пуста) и тумблер «🔗 Автоматом» — включил, и метроном сам следует за темпом песни (поменял ползунок или стиль — метроном перестроился); под bpm — ярлык «темп песни: N», в «Песне» рядом с ползунком — «в метрономе: N» или «= метроном» при связи. Направление «метроном → песня» — только по кнопке. Всё сохраняется; петли нет — метроном песню молча не переписывает.</li>' +
@@ -3771,12 +3906,15 @@ function detectKey(chords){
    scaleHint: 'pentaMin' | 'pentaMaj' | 'mode' — что советовать для импровизации.
    Новый стиль = одна строка здесь. */
 const STYLES = {
-  blues:     { name:'Блюз',       bpm:75,  bpmMin:60,  bpmMax:110, mode:'maj',        formLabel:'12-тактовый блюз I7–IV7',
+  blues:     { name:'Блюз',       bpm:75,  bpmMin:60,  bpmMax:110, mode:'maj',        formLabel:'12-тактовый блюз I7–IV7', swing:66,
                form:[[0,'7'],[0,'7'],[0,'7'],[0,'7'],[3,'7'],[3,'7'],[0,'7'],[0,'7'],[4,'7'],[3,'7'],[0,'7'],[0,'7']],
                scaleHint:'pentaMin', tip:'Классика: минорная пентатоника и изгиб струны на 4-й.' },
-  rocknroll: { name:'Рок-н-ролл', bpm:160, bpmMin:140, bpmMax:185, mode:'maj',        formLabel:'быстрый I–IV–V',
+  rocknroll: { name:'Рок-н-ролл', bpm:160, bpmMin:140, bpmMax:185, mode:'maj',        formLabel:'быстрый I–IV–V', swing:70,
                form:[[0],[0],[3],[0],[4],[0],[3],[0],[0],[3],[0],[4]],
                scaleHint:'pentaMaj' },
+  shuffBlues:{ name:'Шаффл-блюз', bpm:130, bpmMin:110, bpmMax:150, mode:'maj',       formLabel:'быстрый 12-тактовый блюз', swing:66,
+               form:[[0,'7'],[0,'7'],[0,'7'],[0,'7'],[3,'7'],[3,'7'],[0,'7'],[0,'7'],[4,'7'],[3,'7'],[0,'7'],[0,'7']],
+               scaleHint:'pentaMin', tip:'Играй на «1» и на «а» — проговаривай «1-и-а».' },
   punk:      { name:'Панк',       bpm:170, bpmMin:150, bpmMax:190, mode:'maj',        formLabel:'I–IV–V на пауэр-аккордах',
                form:[[0,'5'],[3,'5'],[4,'5'],[0,'5'],[0,'5'],[3,'5'],[4,'5'],[0,'5']],
                scaleHint:'pentaMin', tip:'Три аккорда и правда — пауэр-аккорд двумя пальцами.' },
@@ -3795,7 +3933,7 @@ const STYLES = {
   funk:      { name:'Фанк',       bpm:105, bpmMin:92,  bpmMax:118, mode:'mixolydian', formLabel:'вамп I7–IV7',
                form:[[0,'7'],[0,'7'],[3,'7'],[0,'7'],[0,'7'],[3,'7'],[0,'7'],[3,'7']],
                scaleHint:'mode', tip:'Ритм важнее нот: играй малыми порциями.' },
-  jazz:      { name:'Джаз',       bpm:120, bpmMin:95,  bpmMax:150, mode:'maj',        formLabel:'круг ii7–V7–Imaj7',
+  jazz:      { name:'Джаз',       bpm:120, bpmMin:95,  bpmMax:150, mode:'maj',        formLabel:'круг ii7–V7–Imaj7', swing:55,
                form:[[1,'m7'],[4,'7'],[0,'maj7'],[0,'maj7'],[1,'m7'],[4,'7'],[0,'maj7'],[0,'maj7']],
                scaleHint:'mode' },
   rock:      { name:'Рок',        bpm:125, bpmMin:108, bpmMax:145, mode:'min',        formLabel:'i–♭VII–IV (миксолидийский минор)',
@@ -3822,6 +3960,10 @@ function renderSong(el){
           STRUM_PRESETS.filter(p => p[0] !== 'even').map(p =>
             '<option value="' + p[0] + '">' + p[1] + '</option>').join('') +
         '</select>' +
+        '<label class="row small" style="gap:6px">Качание ' +
+          '<input type="range" id="s-swing" min="0" max="100" value="0" style="width:90px">' +
+          '<b id="s-swingv">0</b>%' +
+        '</label>' +
       '</div>' +
       '<div class="muted small" id="s-stylemsg" style="margin-top:8px; font-size:14px"></div>' +
       '<div class="muted small" id="s-styletip" style="margin-top:4px"></div>' +
@@ -3902,13 +4044,14 @@ function renderSong(el){
   let bpm = Number.isInteger(uiS.bpm) ? Math.max(30, Math.min(240, uiS.bpm))                 // ЕДИНЫЙ темп песни (фон/метроном/подсказки)
     : Number.isInteger(uiS.styleBpm) ? Math.max(30, Math.min(240, uiS.styleBpm)) : STYLES[styleId].bpm; // миграция со styleBpm (v2.6–3.5)
   let bgStrumSel = ['metro', 'even'].concat(STRUM_PRESETS.map(p => p[0])).includes(uiS.bgStrum) ? uiS.bgStrum : 'metro'; // бой фона
+  let swing = Number.isInteger(uiS.swing) ? Math.max(0, Math.min(100, uiS.swing)) : 0; // качание фона (0–100%)
   let generated = false;       // песня собрана «✨ Сделай красиво» (сводка жива для транспонирования)
   let genSummaryBase = '';     // базовая сводка генерации без приставок транспонирования
   let chg = Number.isInteger(uiS.chg) ? uiS.chg : 0; // счётчик правок песни — по нему гриф понимает, что пора перестроиться
   let booted = false;                                // первый рендер вкладки — не считаем изменением
   function persist(){ // правка песни → поднять счётчик и звать гриф (если тот открыт)
     if (booted) chg++;
-    saveUI('song', { seq, key, mode, chordRoot, chordQ, chg, styleId, bpm, bgStrum: bgStrumSel });
+    saveUI('song', { seq, key, mode, chordRoot, chordQ, chg, styleId, bpm, bgStrum: bgStrumSel, swing });
     const fretSec = document.getElementById('tool-fret');
     if (booted && fretSec && fretSec._onSong) fretSec._onSong();
     const toolsSec = document.getElementById('tool-tools');
@@ -4219,12 +4362,15 @@ function renderSong(el){
       b.addEventListener('click', () => {
         styleId = b.dataset.st;
         bpm = STYLES[styleId].bpm; // стиль приносит свой темп — в общий темп песни
+        swing = Number.isInteger(STYLES[styleId].swing) ? STYLES[styleId].swing : 0; // и качание
         persist();
         drawStyleBlock();
         drawSongBpm();
       }));
     $('#s-bpm').value = bpm;
     $('#s-bpmval').textContent = bpm;
+    const sw = $('#s-swing');
+    if (sw){ sw.value = swing; $('#s-swingv').textContent = swing; }
     drawSongBpm();
   }
   function drawSongBpm(){ // ярлык связи с метрономом: «= метроном» или «в метрономе: N»
@@ -4247,6 +4393,7 @@ function renderSong(el){
     const T = Number.isInteger(useT) ? ((useT % 12) + 12) % 12 : Math.floor(Math.random() * 12);
     if (useMode && SONG_MODES.some(x => x[0] === useMode)) mode = useMode; else mode = st.mode;
     bpm = st.bpm; // «Сделай красиво» приносит темп стиля — в общий темп песни
+    swing = Number.isInteger(st.swing) ? st.swing : 0; // и качание (шаффл-блюз/блюз качают сами)
     const dia = diatonicTriads(T, mode);
     seq = st.form.map(f => ({ root: dia[f[0]].root, q: f[1] || dia[f[0]].q }));
     key = T;
@@ -4259,6 +4406,8 @@ function renderSong(el){
     generated = true;
     genSummaryBase = $('#s-stylemsg').innerHTML;
     $('#s-styletip').textContent = st.tip || '';
+    const sw = $('#s-swing');
+    if (sw){ sw.value = swing; $('#s-swingv').textContent = swing; }
   }
   $('#s-gen').addEventListener('click', generateSong);
   $('#s-regen').addEventListener('click', generateSong);
@@ -4282,11 +4431,17 @@ function renderSong(el){
   $('#s-tr-down').addEventListener('click', () => transposeSong(-1));
   $('#s-tr-up').addEventListener('click', () => transposeSong(1));
   $('#s-bpm').addEventListener('input', e => { bpm = +e.target.value; $('#s-bpmval').textContent = bpm; persist(); });
+  const swingSlider = $('#s-swing');
+  if (swingSlider){
+    swingSlider.value = swing;
+    $('#s-swingv').textContent = swing;
+    swingSlider.addEventListener('input', e => { swing = +e.target.value; $('#s-swingv').textContent = swing; persist(); });
+  }
   $('#s-bg').addEventListener('click', () => {
     if (bgTrack){ bgStop(); return; }
     if (!seq.length){ $('#s-stylemsg').textContent = 'Сначала собери песню или нажми «✨ Сделай красиво».'; return; }
     const pattern = bgStrumSel === 'metro' ? (loadUI('tools').strum || '') : strumPatternById(bgStrumSel);
-    bgStart(seq.slice(), bpm, pattern);
+    bgStart(seq.slice(), bpm, pattern, swing);
   });
   const bgStrumSelEl = $('#s-bg-strum');
   if (bgStrumSelEl){
@@ -4639,7 +4794,7 @@ function renderSchool(el){
   { id:'l36', c:2, t:'Универсальный бой D-DU-UDU', x:'Самый ходовой бой поп-музыки: вниз, вниз-вверх, вверх-вниз-вверх. Схема на такт: Д-ДУ-УДУ. Разучи медленно по частям, потом собери.<br><b>Сделай:</b> 8 тактов на Em или Am.' },
   { id:'l37', c:2, t:'Бой «шестёрка» (баллада)', x:'Шесть ударов на такт: Д-Д-ДУ-Д-ДУ — мягкое балладное покачивание. Хорошо звучит с перебором в куплетах.<br><b>Сделай:</b> 8 тактов на C–G–Am–F... или на любой паре аккордов.' },
   { id:'l38', c:2, t:'Регги-скип: акцент на «И»', x:'Регги переворачивает ритм: сильные доли ПРОПУСКАются (глушатся), удары — на «И». Отсюда «прыгающий» грув.<br><b>Сделай:</b> считай «раз-и-два-и» и играй только на «И», на счёт — глушение ладонью.' },
-  { id:'l39', c:2, t:'Шаффл и свинг', x:'Шаффл — восьмые играются неровно: «длинная-короткая», как триоль с паузой. Блюзовый качающий грув.<br><b>Сделай:</b> проговори «1-и-а» и играй D-DU, ударяя на «1» и на «а».' },
+  { id:'l39', c:2, t:'Шаффл и свинг', x:'Шаффл — восьмые играются неровно: «длинная-короткая», как триоль с паузой. Блюзовый качающий грув.<br><b>Сделай:</b> проговори «1-и-а» и играй D-DU, ударяя на «1» и на «а».', app:{ text:'Включи фон с качанием и играй поверх пентатонику — качание во вкладке «🎵 Песня».', tool:'song', btn:'🎵 Песня' } },
   { id:'l40', c:2, t:'Паузы и глушилка', x:'Пауза в бое — это НЕ молчание руки, а глушение: ладонь или пальцы левой кладутся на струны в момент удара. Ритм-машина продолжает качать.<br><b>Сделай:</b> бой D-DU, где первый удар каждого такта — глушёный «чок».' },
   { id:'l41', c:2, t:'Фингерстайл: базовые паттерны', x:'Пальцы правой: p (большой) — бас, i-m-a (указательный-средний-безымянный) — три верхние. Классика: p–i–m–a–m–i.<br><b>Сделай:</b> паттерн p-i-m-a на аккорде Em, медленно, без спешки.' },
   { id:'l42', c:2, t:'Перебор 4-3-2-1', x:'Простой перебор: большой палец по 4-й струне (бас), дальше 3-2-1 по очереди. Держи ровность: каждая нота одинаковой длины.<br><b>Сделай:</b> Am, 4 круга перебора, бас меняется по аккорду.' },
@@ -4999,6 +5154,31 @@ const WIND_INSTRUMENTS = [
 ];
 const WIND_COLOR = '#69db7c';     // ноты лада на духовых
 const TONIC_COLOR = 'var(--bad)'; // тоника (красная)
+
+/* Настоящие аппликатуры (по общедоступным таблицам) — только там, где стандартизовано
+   и уверенно. Формат: midi → { h: [состояния отверстий СВЕРХУ ВНИЗ: 2 закрыт,
+   1 полуприкрыт, 0 открыт], o: оверблоу (те же пальцы, дуть сильнее) }.
+   Тин-вистл (ре): первая октава D–E–F♯–G–A–B линейна (уверенно); C♮ — крестованная,
+   C♯ — крест с закрытым низом (как обычно учат); вторая октава — те же пальцы +
+   оверблоу. Сопилка/блокфлейта/флейта — без записи (упрощённая модель + честная пометка). */
+const REAL_FINGERINGS = {
+  'whistle-d': (function(){
+    const lin = [
+      { m: 62, h: [2,2,2,2,2,2] },
+      { m: 64, h: [2,2,2,2,2,0] },
+      { m: 66, h: [2,2,2,2,0,0] },
+      { m: 67, h: [2,2,2,0,0,0] },
+      { m: 69, h: [2,2,0,0,0,0] },
+      { m: 71, h: [2,0,0,0,0,0] },
+    ];
+    const out = {};
+    lin.forEach(n => { out[n.m] = { h: n.h, o: false }; out[n.m + 12] = { h: n.h, o: true }; }); // 2-я октава — оверблоу
+    out[72] = { h: [0,2,2,2,2,0], o: false };  // C♮5 — крестованная (верх открыт, крест на 2–5, низ открыт)
+    out[73] = { h: [0,2,2,2,2,2], o: false };  // C♯5 — крест с закрытым низом
+    out[84] = { h: [0,2,2,2,2,0], o: true };   // C♮6 — крест + оверблоу
+    return out;
+  })(),
+};
 function getWindDef(){ // текущее определение духового (с учётом своих отверстий)
   const uiW = loadUI('wind');
   const id = WIND_INSTRUMENTS.some(x => x.id === uiW.inst) ? uiW.inst : WIND_INSTRUMENTS[0].id;
@@ -5022,6 +5202,7 @@ function renderWind(el){
   let melody = null, melodyTimers = [], melodyBpm = Number.isInteger(uiW.melodyBpm) ? uiW.melodyBpm : 120;
   let melodyShow = uiW.melodyShow !== false;
   let melHit = -1;
+  let windReal = uiW.windReal === true; // «Настоящая аппликатура» (для инструментов с таблицей)
   const PHRASE_WIND = '#4dd0e1';
   const $ = s => el.querySelector(s);
 
@@ -5055,7 +5236,14 @@ function renderWind(el){
         '<span class="muted small" id="w-info"></span>' +
       '</div>' +
       '<div class="fb-scroll" id="w-svg" style="margin-top:12px"></div>' +
-      '<h3 style="margin:14px 0 6px; font-size:14px">Аппликатурные схемы — гамма на отверстиях</h3>' +
+      '<div class="row" style="margin:14px 0 6px; align-items:center">' +
+        '<h3 style="margin:0; font-size:14px">Аппликатурные схемы — гамма на отверстиях</h3>' +
+        '<span class="row small" style="gap:4px; margin-left:auto">' +
+          '<span class="muted small">Аппликатура:</span>' +
+          '<button class="chip' + (windReal && REAL_FINGERINGS[def().id] ? ' on' : '') + '" data-wreal="1"' + (REAL_FINGERINGS[def().id] && !def().custom ? '' : ' disabled title="пока только упрощённая"') + '>Настоящая</button>' +
+          '<button class="chip' + (!windReal || !REAL_FINGERINGS[def().id] ? ' on' : '') + '" data-wreal="0"' + (windReal && !REAL_FINGERINGS[def().id] ? ' disabled' : '') + '>Упрощённая</button>' +
+        '</span>' +
+      '</div>' +
       '<div class="fb-scroll" id="w-finger" style="padding-bottom:4px"></div>' +
       '<details class="side-box" id="w-custom-box" style="margin-top:12px; border-top:3px solid var(--accent)">' +
         '<summary style="cursor:pointer; font-weight:700; color:var(--accent); letter-spacing:1.2px; font-size:13px">⚙️ СВОЙ СТРОЙ — число отверстий и нота каждого положения</summary>' +
@@ -5071,10 +5259,12 @@ function renderWind(el){
       '</div>' +
       '<div class="side-list" id="w-mel-chips" style="margin-top:8px"></div>' +
       '<div class="muted small" style="margin-top:8px">Клик по отверстию — нота флейтой. <b>Повторяй ноты смело — повторение и делает мелодию.</b> Табы: бирюзовые номера над отверстиями — порядок игры.</div>' +
+      '<div class="muted small" style="margin-top:6px">Полуприкрытое отверстие — палец наполовину (блеррола нет, это крест); ▲ = оверблоу: те же пальцы, дуй сильнее — так берут вторую октаву. ' +
+      'Настоящая аппликатура показывается для инструментов со стандартизованными таблицами; для «своего строя» — только упрощённая.</div>' +
     '</div>';
 
   function stopMel(){ melodyTimers.forEach(clearTimeout); melodyTimers = []; melHit = -1; }
-  function persistW(){ saveUI('wind', { inst, tonic, scaleKey, melodyBpm, melodyShow }); }
+  function persistW(){ saveUI('wind', { inst, tonic, scaleKey, melodyBpm, melodyShow, windReal }); }
 
   function scaleEntries(){ // позиции (индексы), чьи ноты в гамме
     const d = def();
@@ -5150,23 +5340,65 @@ function renderWind(el){
     if (!box) return;
     const d = def();
     const H = d.holes;
-    const entries = scaleEntries();
+    const realMap = (windReal && !d.custom && REAL_FINGERINGS[d.id]) || null; // настоящий режим: есть таблица и нет ★-строя
+    let entries = scaleEntries();
+    if (realMap){ // настоящая таблица добирает «хроматические» ноты (C♮/C♯…) — гаммы не дырявятся
+      const extra = Object.keys(realMap).map(Number)
+        .filter(m => ivIn(m, tonic, SCALES[scaleKey].iv) && !entries.some(x => x.midi === m))
+        .map(m => ({ k: m - d.notes[0], midi: m }));
+      entries = entries.concat(extra).sort((a, b) => a.midi - b.midi);
+    }
+    (function syncWreal(){ // чипы «Настоящая/Упрощённая» — живые при смене инструмента
+      const b1 = $('[data-wreal="1"]'), b0 = $('[data-wreal="0"]');
+      if (!b1 || !b0) return;
+      const avail = !!REAL_FINGERINGS[d.id] && !d.custom;
+      b1.disabled = !avail;
+      b1.title = avail ? 'Настоящие схемы из таблиц' : (d.custom ? 'свой строй — упрощённые схемы' : 'пока только упрощённая');
+      if (!avail) windReal = false;
+      b1.classList.toggle('on', windReal && avail);
+      b0.disabled = windReal && !avail;
+      b0.classList.toggle('on', !(windReal && avail));
+    })();
     box.innerHTML = entries.map(e => {
-      const open = Math.min(e.k, H); // открыты нижние k отверстий
-      let col = '<svg width="26" height="' + (H * 18 + 8) + '" viewBox="0 0 26 ' + (H * 18 + 8) + '">';
-      for (let h = 0; h < H; h++){
-        const closed = h < H - open; // сверху закрытые
-        const cy = 10 + h * 18;
-        col += '<circle cx="13" cy="' + cy + '" r="6.5" fill="' + (closed ? WIND_COLOR : 'none') + '" stroke="currentColor" stroke-opacity=".55"/>';
+      const real = realMap && realMap[e.midi];
+      let col, name;
+      if (real){
+        col = '<svg width="26" height="' + (H * 18 + 8) + '" viewBox="0 0 26 ' + (H * 18 + 8) + '">';
+        for (let h = 0; h < H; h++){
+          const st = real.h[h] !== undefined ? real.h[h] : 0;
+          const cy = 10 + h * 18;
+          col += '<circle cx="13" cy="' + cy + '" r="6.5" fill="none" stroke="currentColor" stroke-opacity=".55"/>';
+          if (st === 2) col += '<circle cx="13" cy="' + cy + '" r="6.5" fill="' + WIND_COLOR + '"/>';
+          else if (st === 1) col += '<path d="M ' + (13 - 6.5) + ' ' + cy + ' A 6.5 6.5 0 0 1 ' + (13 + 6.5) + ' ' + cy + ' Z" fill="' + WIND_COLOR + '" stroke="none"/>'; // верхняя половина — полуприкрыто
+        }
+        col += '</svg>';
+        name = '<div class="w-fname">' + esc(pcName(e.midi)) + (real.o ? ' <span style="color:var(--accent); cursor:help" title="Оверблоу: те же пальцы — дуй сильнее">▲</span>' : '') + '</div>';
+      } else {
+        const open = Math.min(e.k, H); // открыты нижние k отверстий (упрощённая модель)
+        let colSvg = '<svg width="26" height="' + (H * 18 + 8) + '" viewBox="0 0 26 ' + (H * 18 + 8) + '">';
+        for (let h = 0; h < H; h++){
+          const closed = h < H - open; // сверху закрытые
+          const cy = 10 + h * 18;
+          colSvg += '<circle cx="13" cy="' + cy + '" r="6.5" fill="' + (closed ? WIND_COLOR : 'none') + '" stroke="currentColor" stroke-opacity=".55"/>';
+        }
+        colSvg += '</svg>';
+        col = colSvg;
+        name = '<div class="w-fname"' + (realMap ? ' style="opacity:.45" title="нет в настоящей таблице — показано упрощённо"' : '') + '>' + esc(pcName(e.midi)) + '</div>';
       }
-      col += '</svg>';
-      return '<div class="w-finger"><div class="w-fcol">' + col + '</div><div class="w-fname">' + esc(pcName(e.midi)) + '</div></div>';
+      return '<div class="w-finger"><div class="w-fcol">' + col + '</div>' + name + '</div>';
     }).join('') || '<span class="muted small">В этой гамме нет ни одной ноты на инструменте — смени тонику или гамму.</span>';
     box.querySelectorAll('.w-finger').forEach((w, i) => {
       w.style.cursor = 'pointer';
       w.addEventListener('click', () => windNote(entries[i].midi, 0.9));
     });
   }
+  el.querySelectorAll('[data-wreal]').forEach(b =>
+    b.addEventListener('click', () => {
+      if (b.disabled) return;
+      windReal = b.dataset.wreal === '1';
+      persistW();
+      draw();
+    }));
 
   function drawCustom(){
     const box = $('#w-custom');
