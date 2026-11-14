@@ -1,0 +1,16 @@
+{
+  "name": "Джем",
+  "short_name": "Джем",
+  "description": "Смотрю и играю: гриф с гаммами, круги, песня по аккордам, тюнер, метроном, определитель аккордов.",
+  "lang": "ru",
+  "display": "standalone",
+  "start_url": "./",
+  "scope": "./",
+  "theme_color": "#141210",
+  "background_color": "#ffb454",
+  "icons": [
+    { "src": "icons/icon-192-jamm.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icons/icon-512-jamm.png", "sizes": "512x512", "type": "image/png" },
+    { "src": "icons/icon-512-jamm.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
