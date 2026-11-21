@@ -1,8 +1,8 @@
 {
   "name": "Jamm",
   "short_name": "Jamm",
-  "description": "Смотрю и играю: гриф с гаммами, круги, песня по аккордам, тюнер, метроном, определитель аккордов.",
-  "lang": "ru",
+  "description": "Play along: fretboard with scales, circles, song by chords, tuner, metronome, chord detector.",
+  "lang": "en",
   "display": "standalone",
   "start_url": "./",
   "scope": "./",

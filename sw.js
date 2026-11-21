@@ -1,7 +1,7 @@
 /* Jamm — service worker (офлайн-кэш PWA).
    ВАЖНО: при публикации новой версии поднять VERSION здесь И APP_VERSION в index.html —
    имя кэша с версией, иначе телефон останется на старой. */
-const VERSION = '0.0.2';
+const VERSION = '0.0.3';
 const CACHE = 'jamm-' + VERSION;
 const ASSETS = [
   './',
